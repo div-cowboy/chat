@@ -291,6 +291,13 @@ import type {
 /** Default lifetime of one native stream segment before it is rotated. */
 const DEFAULT_STREAM_SEGMENT_MAX_AGE_MS = 240_000;
 /**
+ * Slack's cumulative `markdown_text` limit across start/append/stop of one
+ * native stream. The call that exceeds it returns `msg_too_long`.
+ */
+const STREAM_SEGMENT_MAX_CHARS = 12_000;
+const HIGH_SURROGATE_START = 0xd800;
+const HIGH_SURROGATE_END = 0xdbff;
+/**
  * Once a segment is past its max age, rotation waits up to this long for a
  * paragraph break so a paragraph, list, or table is not split across two
  * messages. The default max age plus this grace stays below Slack's roughly
@@ -398,6 +405,83 @@ function segmentCutIndex(text: string): number {
     return paragraphBreak + 2;
   }
   return text.lastIndexOf("\n") + 1;
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= HIGH_SURROGATE_START && code <= HIGH_SURROGATE_END;
+}
+
+/** Length of the first UTF-16 code point in `text`. */
+function firstCodePointLength(text: string): number {
+  if (text.length === 0) {
+    return 0;
+  }
+  if (isHighSurrogate(text.charCodeAt(0)) && text.length > 1) {
+    return 2;
+  }
+  return 1;
+}
+
+/** Largest cut <= `max` that does not split a UTF-16 surrogate pair. */
+function safeCharCut(text: string, max: number): number {
+  if (max >= text.length) {
+    return text.length;
+  }
+  if (max <= 0) {
+    return 0;
+  }
+  if (isHighSurrogate(text.charCodeAt(max - 1))) {
+    return max - 1;
+  }
+  return max;
+}
+
+/**
+ * Characters of the fence closer rotateSegment would append to `text`.
+ * Reserved so a later rotation can close an open fence without overflowing.
+ */
+function fenceCloserLength(text: string): number {
+  const fence = openFenceIn(text);
+  if (!fence) {
+    return 0;
+  }
+  return (text.endsWith("\n") ? 0 : 1) + fence.marker.length;
+}
+
+/**
+ * Split `text` so `head` fits in `remaining` characters of the current
+ * segment. Prefers a paragraph then line break inside the remaining window.
+ * When the first line does not fit in `remaining` but would fit in an empty
+ * segment (`fullBudget`), `head` is empty so the caller can rotate first.
+ * A line longer than `fullBudget` is hard-split at `remaining`.
+ */
+function splitStreamDelta(
+  text: string,
+  remaining: number,
+  fullBudget: number
+): { head: string; tail: string } {
+  if (text.length === 0 || remaining >= text.length) {
+    return { head: text, tail: "" };
+  }
+  if (remaining > 0) {
+    const cut = segmentCutIndex(text.slice(0, remaining));
+    if (cut > 0) {
+      return { head: text.slice(0, cut), tail: text.slice(cut) };
+    }
+  }
+  const newlineAt = text.indexOf("\n");
+  const lineLength = newlineAt === -1 ? text.length : newlineAt + 1;
+  if (lineLength <= fullBudget && lineLength > Math.max(remaining, 0)) {
+    return { head: "", tail: text };
+  }
+  if (remaining <= 0) {
+    return { head: "", tail: text };
+  }
+  const cut = safeCharCut(text, remaining);
+  if (cut > 0) {
+    return { head: text.slice(0, cut), tail: text.slice(cut) };
+  }
+  return { head: "", tail: text };
 }
 
 /**
@@ -5685,8 +5769,11 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
    *
    * Slack expires a native stream after roughly five minutes, so a reply
    * that streams longer than `streamSegmentMaxAgeMs` is finalized and
-   * continued in a new message. The returned `id` is the last message of
-   * the reply, and `messageIds` lists every message of the reply in order.
+   * continued in a new message. A segment is also rotated before its
+   * cumulative `markdown_text` (including ChatStreamer-buffered text) would
+   * exceed Slack's 12,000-character limit. The returned `id` is the last
+   * message of the reply, and `messageIds` lists every message of the reply
+   * in order.
    *
    * Falls back to post-and-edit when the thread lacks native stream context.
    */
@@ -5742,7 +5829,9 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     // continued in a fresh segment (see rotateSegment). `startedAt` is
     // stamped by the first API call that succeeds on the segment, which is
     // when Slack's expiry clock starts; until then the ChatStreamer only
-    // buffers text locally.
+    // buffers text locally. `queuedChars` counts markdown_text handed to
+    // this streamer (flushed or still in its buffer) so a later append or
+    // stop cannot exceed STREAM_SEGMENT_MAX_CHARS.
     const segment: {
       streamer: ReturnType<typeof createStreamer>;
       startedAt: number | undefined;
@@ -5761,12 +5850,15 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
        * text if that text continues the table cut by the previous segment.
        */
       tableHeader: string;
+      /** markdown_text characters queued on this streamer, including buffer. */
+      queuedChars: number;
     } = {
       streamer: createStreamer(),
       startedAt: undefined,
       flushNextAppend: false,
       reopenFence: "",
       tableHeader: "",
+      queuedChars: 0,
     };
     let rotations = 0;
     /** Message IDs of the segments finalized so far, in order. */
@@ -5989,6 +6081,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       segment.streamer = createStreamer();
       segment.startedAt = undefined;
       segment.flushNextAppend = true;
+      segment.queuedChars = 0;
       const fence = openFenceIn(sent);
       segment.reopenFence = fence ? `${fence.opening}\n` : "";
       segment.tableHeader = fence ? "" : tableContinuation(sent);
@@ -6031,13 +6124,15 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
 
     /**
      * Finalize the current segment and continue in a new one. `delta` is the
-     * resolved text about to be sent: the part up to its last paragraph
-     * break (or last line break) travels with the old segment's stop call so
-     * the cut lands on a block boundary, and a code fence still open there
-     * is closed. Returns the text to send on the new segment.
+     * resolved text about to be sent: the part up to `cutAt` (default: last
+     * paragraph break, or last line break) travels with the old segment's
+     * stop call so the cut lands on a block boundary, and a code fence still
+     * open there is closed. Returns the text to send on the new segment.
      */
-    const rotateSegment = async (delta: string): Promise<string> => {
-      const cutAt = segmentCutIndex(delta);
+    const rotateSegment = async (
+      delta: string,
+      cutAt = segmentCutIndex(delta)
+    ): Promise<string> => {
       let head = delta.slice(0, cutAt);
       let tail = delta.slice(cutAt);
       let sent = lastAppended + head;
@@ -6098,6 +6193,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
           disableStructuredChunks("task_update", error);
         }
         lastFlushed = sent;
+        lastAppended = sent;
         this.logger.debug("Slack: rotated stream segment", {
           channel,
           messageId: result.ts,
@@ -6116,37 +6212,95 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         );
         tail = lastAppended.slice(lastFlushed.length) + delta;
         sent = lastFlushed;
+        lastAppended = lastFlushed;
       }
       await startNextSegment(sent);
       return tail;
     };
 
     /**
+     * Prefix characters `withSegmentPrefix` would prepend to `text` without
+     * consuming the queued fence/table prefix.
+     */
+    const pendingPrefixLength = (text: string): number => {
+      const newlineAt = text.indexOf("\n");
+      const firstLine = text.slice(
+        0,
+        newlineAt === -1 ? text.length : newlineAt
+      );
+      const header = TABLE_ROW_PATTERN.test(firstLine.trim())
+        ? segment.tableHeader
+        : "";
+      return segment.reopenFence.length + header.length;
+    };
+
+    const remainingChars = (text: string): number =>
+      STREAM_SEGMENT_MAX_CHARS -
+      segment.queuedChars -
+      pendingPrefixLength(text) -
+      fenceCloserLength(lastAppended);
+
+    /**
      * Send a resolved-text delta to the native stream, rotating the segment
-     * first when it is due. Rotation carries the leading part of the delta
-     * out with the old segment, so only what it returns goes to the new one.
+     * first when it is due for age or when the next text would exceed the
+     * cumulative markdown_text budget. Rotation carries the leading part of
+     * the delta out with the old segment, so only what it returns goes to
+     * the new one.
      */
     const sendDelta = async (
       delta: string,
       atBlockBoundary: boolean
     ): Promise<void> => {
-      const text = rotationDue(atBlockBoundary || delta.includes("\n\n"))
-        ? await rotateSegment(delta)
-        : delta;
-      if (text.length > 0) {
+      let text = delta;
+      while (text.length > 0) {
+        const remaining = remainingChars(text);
+        if (text.length > remaining) {
+          const fullBudget =
+            STREAM_SEGMENT_MAX_CHARS - fenceCloserLength(lastAppended);
+          const { head } = splitStreamDelta(
+            text,
+            Math.max(remaining, 0),
+            Math.max(fullBudget, 0)
+          );
+          if (head.length === 0) {
+            if (segment.queuedChars === 0) {
+              let at = safeCharCut(text, Math.max(remaining, 0));
+              if (at <= 0) {
+                at = firstCodePointLength(text);
+              }
+              text = await rotateSegment(text, at);
+              continue;
+            }
+            text = await rotateSegment(text, 0);
+            continue;
+          }
+          text = await rotateSegment(text, head.length);
+          continue;
+        }
+        if (rotationDue(atBlockBoundary || text.includes("\n\n"))) {
+          text = await rotateSegment(text);
+          continue;
+        }
         // append() buffers small deltas in memory and returns null until it
         // actually calls the API — only a non-null response proves content
         // is rendering natively. An empty chunks array makes it flush right
         // away, so a segment opened by rotation is visible immediately.
+        const payload = withSegmentPrefix(text);
+        segment.queuedChars += payload.length;
         const response = await segment.streamer.append({
-          markdown_text: withSegmentPrefix(text),
+          markdown_text: payload,
           token,
           ...(segment.flushNextAppend ? { chunks: [] } : {}),
         });
+        lastAppended += text;
         if (response) {
           markSegmentStarted();
-          lastFlushed = resolvedCommitted;
+          lastFlushed = lastAppended;
         }
+        text = "";
+      }
+      if (delta.length === 0 && rotationDue(atBlockBoundary)) {
+        await rotateSegment("");
       }
       lastAppended = resolvedCommitted;
     };

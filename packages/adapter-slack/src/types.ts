@@ -94,7 +94,8 @@ export type SlackSuggestedPrompts =
 
 /**
  * Result of `SlackAdapter.stream()`. A reply that streams longer than
- * `streamSegmentMaxAgeMs` is split into several Slack messages; `id` is the
+ * `streamSegmentMaxAgeMs`, or that would exceed Slack's 12,000-character
+ * `markdown_text` limit, is split into several Slack messages; `id` is the
  * last one and `messageIds` lists all of them in order, ending with `id`.
  */
 export interface SlackStreamResult extends RawMessage<unknown> {

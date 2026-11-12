@@ -14187,6 +14187,240 @@ describe("native stream rotation", () => {
       expect(chatStream).toHaveBeenCalledTimes(1);
     });
   });
+
+  const MARKDOWN_LIMIT = 12_000;
+
+  function markdownParts(segment: {
+    append: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+  }): string[] {
+    const parts: string[] = [];
+    for (const call of segment.append.mock.calls) {
+      const text = (call[0] as { markdown_text?: string }).markdown_text;
+      if (text) {
+        parts.push(text);
+      }
+    }
+    for (const call of segment.stop.mock.calls) {
+      const text = (call[0] as { markdown_text?: string }).markdown_text;
+      if (text) {
+        parts.push(text);
+      }
+    }
+    return parts;
+  }
+
+  function cumulativeLength(parts: string[]): number {
+    let total = 0;
+    for (const part of parts) {
+      total += part.length;
+    }
+    return total;
+  }
+
+  it("rotates before cumulative markdown exceeds Slack's 12,000-character limit", async () => {
+    const { adapter, segments, chatStream } = setup();
+    const first = `${"a".repeat(7000)}\n\n`;
+    const second = `${"b".repeat(7000)}\n\n`;
+    async function* stream() {
+      yield first;
+      yield second;
+    }
+
+    const result = await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(cumulativeLength(markdownParts(segments[0]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+    expect(cumulativeLength(markdownParts(segments[1]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+    expect(markdownParts(segments[0]).join("")).toContain("a".repeat(7000));
+    expect(markdownParts(segments[0]).join("")).not.toContain("b".repeat(7000));
+    expect(markdownParts(segments[1]).join("")).toContain("b".repeat(7000));
+    expect(result).toMatchObject({
+      id: "1234567890.1",
+      messageIds: ["1234567890.0", "1234567890.1"],
+    });
+  });
+
+  it("rotates when many small deltas accumulate past the markdown limit", async () => {
+    const { adapter, segments, chatStream } = setup();
+    async function* stream() {
+      for (let i = 0; i < 13; i++) {
+        yield `${"x".repeat(1000)}\n`;
+      }
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream.mock.calls.length).toBeGreaterThan(1);
+    for (const segment of segments.slice(0, chatStream.mock.calls.length)) {
+      expect(cumulativeLength(markdownParts(segment))).toBeLessThanOrEqual(
+        MARKDOWN_LIMIT
+      );
+    }
+  });
+
+  it("cuts at a paragraph break inside the remaining character budget", async () => {
+    const { adapter, segments, chatStream } = setup();
+    async function* stream() {
+      yield `${"a".repeat(7000)}\n\n`;
+      yield `${"b".repeat(2000)}\n\n${"c".repeat(6000)}\n\n`;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    const firstText = markdownParts(segments[0]).join("");
+    const secondText = markdownParts(segments[1]).join("");
+    expect(firstText).toContain("b".repeat(2000));
+    expect(firstText).not.toContain("c".repeat(6000));
+    expect(secondText).toContain("c".repeat(6000));
+    expect(cumulativeLength(markdownParts(segments[0]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+  });
+
+  it("rotates before a line that fits in a new segment rather than splitting a link", async () => {
+    const { adapter, segments, chatStream } = setup();
+    const link = `https://example.com/${"p".repeat(80)}`;
+    async function* stream() {
+      yield `${"a".repeat(11_950)}\n`;
+      yield `${link}\n`;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    const firstText = markdownParts(segments[0]).join("");
+    const secondText = markdownParts(segments[1]).join("");
+    expect(firstText).not.toContain("https://example.com/");
+    expect(secondText).toContain(link);
+    expect(secondText.split(link)).toHaveLength(2);
+  });
+
+  it("hard-splits a single line longer than the markdown limit", async () => {
+    const { adapter, segments, chatStream } = setup();
+    const line = "z".repeat(15_000);
+    async function* stream() {
+      yield line;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream.mock.calls.length).toBeGreaterThan(1);
+    expect(cumulativeLength(markdownParts(segments[0]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+    expect(cumulativeLength(markdownParts(segments[1]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+    expect(
+      markdownParts(segments[0]).join("") + markdownParts(segments[1]).join("")
+    ).toContain("z".repeat(15_000));
+  });
+
+  it("does not split a UTF-16 surrogate pair when hard-cutting at the budget", async () => {
+    const { adapter, segments, chatStream } = setup();
+    async function* stream() {
+      yield `${"a".repeat(11_999)}\u{1F600}`;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    const firstText = markdownParts(segments[0]).join("");
+    const secondText = markdownParts(segments[1]).join("");
+    expect(firstText).toBe("a".repeat(11_999));
+    expect(secondText).toBe("\u{1F600}");
+  });
+
+  it("closes and reopens a fence when length rotation cuts inside a code block", async () => {
+    const { adapter, segments, chatStream } = setup();
+    async function* stream() {
+      yield "```ts\n";
+      yield `${"c".repeat(7000)}\n`;
+      yield `${"d".repeat(7000)}\n`;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(cumulativeLength(markdownParts(segments[0]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+    expect(markdownParts(segments[0]).join("").endsWith("```")).toBe(true);
+    expect(markdownParts(segments[1]).join("").startsWith("```ts\n")).toBe(
+      true
+    );
+  });
+
+  it("repeats the table header when length rotation cuts inside a table", async () => {
+    const { adapter, segments, chatStream } = setup();
+    async function* stream() {
+      yield "| a | b |\n|---|---|\n";
+      yield `| ${"1".repeat(7000)} | 2 |\n`;
+      yield `| ${"3".repeat(7000)} | 4 |\n`;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(
+      markdownParts(segments[1]).join("").startsWith("| a | b |\n|---|---|\n")
+    ).toBe(true);
+  });
+
+  it("counts ChatStreamer-buffered text toward the segment budget", async () => {
+    const { adapter, segments, chatStream } = setup();
+    segments[0].append.mockResolvedValue(null);
+    async function* stream() {
+      yield `${"a".repeat(7000)}\n\n`;
+      yield `${"b".repeat(7000)}\n\n`;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+    expect(cumulativeLength(markdownParts(segments[0]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+    expect(markdownParts(segments[1]).join("")).toContain("b".repeat(7000));
+  });
+
+  it("rotates when finish() flushes held text past the markdown limit", async () => {
+    const { adapter, segments, chatStream } = setup();
+    async function* stream() {
+      yield "a".repeat(7000);
+      yield "b".repeat(7000);
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream.mock.calls.length).toBeGreaterThan(1);
+    expect(cumulativeLength(markdownParts(segments[0]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+    expect(cumulativeLength(markdownParts(segments[1]))).toBeLessThanOrEqual(
+      MARKDOWN_LIMIT
+    );
+  });
+
+  it("still rotates by length when streamSegmentMaxAgeMs is Infinity", async () => {
+    const { adapter, chatStream } = setup({
+      streamSegmentMaxAgeMs: Number.POSITIVE_INFINITY,
+    });
+    async function* stream() {
+      yield `${"a".repeat(7000)}\n\n`;
+      yield `${"b".repeat(7000)}\n\n`;
+    }
+
+    await adapter.stream(THREAD, stream());
+
+    expect(chatStream).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("native streaming fallback", () => {
