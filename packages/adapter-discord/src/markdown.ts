@@ -37,6 +37,7 @@ import {
 
 const SUPPRESSED_AUTOLINK_REGEX = /^<https?:\/\/[^<>\s]+>$/i;
 const SUPPRESSED_MASKED_LINK_REGEX = /\]\(<https?:\/\/[^<>\s]+>\)$/i;
+const LINE_BREAK_REGEX = /\r\n|\r|\n/;
 
 // biome-ignore lint/style/noEnum: Link styles must use an enum.
 enum DiscordLinkStyle {
@@ -59,6 +60,10 @@ function getDiscordLinkStyle(source: string): DiscordLinkStyle | undefined {
 }
 
 export class DiscordFormatConverter extends BaseFormatConverter {
+  // Discord renders markdown, where an unindented line ends the list item it
+  // belongs to.
+  protected override indentListContinuationLines = true;
+
   /**
    * Convert bare `@mentions` to Discord format (`@name` → `<@name>`), leaving
    * emails, URLs, code spans, and existing `<@…>` tokens untouched.
@@ -245,9 +250,16 @@ export class DiscordFormatConverter extends BaseFormatConverter {
     }
 
     if (isBlockquoteNode(node)) {
+      // Quote every line, and keep a quoted blank line between blocks,
+      // so paragraphs and list items stay apart inside the quote.
       return getNodeChildren(node)
-        .map((child) => `> ${this.nodeToDiscordMarkdown(child)}`)
-        .join("\n");
+        .map((child) =>
+          this.nodeToDiscordMarkdown(child)
+            .split(LINE_BREAK_REGEX)
+            .map((line) => (line ? `> ${line}` : ">"))
+            .join("\n")
+        )
+        .join("\n>\n");
     }
 
     if (isListNode(node)) {
