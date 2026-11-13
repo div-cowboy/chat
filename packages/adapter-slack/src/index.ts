@@ -5761,12 +5761,21 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
        * text if that text continues the table cut by the previous segment.
        */
       tableHeader: string;
+      /**
+       * Markdown this segment has handed to the streamer, including any
+       * synthetic fence or table prefix.
+       */
+      appendedMarkdown: string;
+      /** Prefix of `appendedMarkdown` Slack has confirmed. */
+      confirmedMarkdown: string;
     } = {
       streamer: createStreamer(),
       startedAt: undefined,
       flushNextAppend: false,
       reopenFence: "",
       tableHeader: "",
+      appendedMarkdown: "",
+      confirmedMarkdown: "",
     };
     let rotations = 0;
     /** Message IDs of the segments finalized so far, in order. */
@@ -5910,6 +5919,39 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     const isStreamExpired = (error: unknown): boolean =>
       slackPlatformErrorCode(error) === STREAM_EXPIRED_ERROR;
 
+    /**
+     * Slack seals an expired stream as an error. `chat.update` on that
+     * message's `ts` turns it into a normal message with the markdown Slack
+     * already confirmed, which clears the error. Unconfirmed text still
+     * continues in a new segment. A failed update must not change that.
+     */
+    const repairExpiredSegment = async (): Promise<void> => {
+      const ts = segment.streamer.ts;
+      if (!ts) {
+        return;
+      }
+      let markdown = segment.confirmedMarkdown;
+      const fence = openFenceIn(markdown);
+      if (fence) {
+        markdown += `${markdown.endsWith("\n") ? "" : "\n"}${fence.marker}`;
+      }
+      try {
+        await this._client.chat.update(
+          await this.withToken({
+            channel,
+            ts,
+            markdown_text: markdown,
+          })
+        );
+      } catch (error) {
+        this.logger.warn("Slack: expired stream segment repair failed", {
+          channel,
+          messageId: ts,
+          error,
+        });
+      }
+    };
+
     /** Record that Slack accepted a call on the current segment. */
     const markSegmentStarted = (): void => {
       segment.startedAt ??= Date.now();
@@ -5989,6 +6031,8 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       segment.streamer = createStreamer();
       segment.startedAt = undefined;
       segment.flushNextAppend = true;
+      segment.appendedMarkdown = "";
+      segment.confirmedMarkdown = "";
       const fence = openFenceIn(sent);
       segment.reopenFence = fence ? `${fence.opening}\n` : "";
       segment.tableHeader = fence ? "" : tableContinuation(sent);
@@ -6116,6 +6160,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         );
         tail = lastAppended.slice(lastFlushed.length) + delta;
         sent = lastFlushed;
+        await repairExpiredSegment();
       }
       await startNextSegment(sent);
       return tail;
@@ -6138,12 +6183,15 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         // actually calls the API — only a non-null response proves content
         // is rendering natively. An empty chunks array makes it flush right
         // away, so a segment opened by rotation is visible immediately.
+        const markdown = withSegmentPrefix(text);
+        segment.appendedMarkdown += markdown;
         const response = await segment.streamer.append({
-          markdown_text: withSegmentPrefix(text),
+          markdown_text: markdown,
           token,
           ...(segment.flushNextAppend ? { chunks: [] } : {}),
         });
         if (response) {
+          segment.confirmedMarkdown = segment.appendedMarkdown;
           markSegmentStarted();
           lastFlushed = resolvedCommitted;
         }
@@ -6211,6 +6259,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         markSegmentStarted();
         // Sending chunks flushes the streamer's text buffer as well.
         lastFlushed = lastAppended;
+        segment.confirmedMarkdown = segment.appendedMarkdown;
         rememberStructuredChunk(chunk);
       } catch (error) {
         disableStructuredChunks(chunk.type, error);
@@ -6313,6 +6362,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
             skippedBlocks: stopBlocks.length,
           }
         );
+        await repairExpiredSegment();
         await this.endTyping(threadId, options?.sessionStatus ?? "active");
         return toStreamResult({
           id: expiredTs,
@@ -6326,6 +6376,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
           channel,
         }
       );
+      await repairExpiredSegment();
       await startNextSegment(lastFlushed);
       result = await segment.streamer.stop({
         ...stopArgs,
